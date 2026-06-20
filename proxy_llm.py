@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
+"""ComputerCraft proxy backed by an OpenAI-compatible LM Studio server."""
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 import json
+import os
 import requests
 
-# Port the api is hosted on
-PORT = 8080
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8080"))
 
-# LM Studio OpenAI-compatible endpoint
-LMSTUDIO_URL = "http://192.168.1.245:1234/v1/chat/completions"
+LMSTUDIO_URL = os.environ.get(
+    "LMSTUDIO_URL",
+    "http://127.0.0.1:1234/v1/chat/completions",
+)
+LMSTUDIO_MODEL = os.environ.get("LMSTUDIO_MODEL", "local-model")
+LMSTUDIO_MAX_TOKENS = int(os.environ.get("LMSTUDIO_MAX_TOKENS", "200"))
+LMSTUDIO_TEMPERATURE = float(os.environ.get("LMSTUDIO_TEMPERATURE", "0.7"))
+LMSTUDIO_TIMEOUT = int(os.environ.get("LMSTUDIO_TIMEOUT", "120"))
+PROXY_TOKEN = os.environ.get("PROXY_TOKEN")
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "8192"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 
-# conversation storage
 SYSTEM_PROMPT = {
     "role": "system",
     "content": (
@@ -72,11 +82,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         log(f"{self.client_ip()} -> TEXT {code}")
 
+    def is_authorized(self):
+        if not PROXY_TOKEN:
+            return True
+
+        auth_header = self.headers.get("Authorization", "")
+        bearer_token = auth_header.removeprefix("Bearer ").strip()
+        header_token = self.headers.get("X-Proxy-Token", "").strip()
+        return PROXY_TOKEN in {bearer_token, header_token}
+
+    def reject_unauthorized(self):
+        self.send_json(401, {"error": "unauthorized"})
+
+    def read_json_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+
+        if length <= 0:
+            raise ValueError("missing request body")
+
+        if length > MAX_BODY_BYTES:
+            raise ValueError(f"request body exceeds {MAX_BODY_BYTES} bytes")
+
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body)
+
     # ---------------- GET ----------------
 
     def do_GET(self):
 
         log(f"{self.client_ip()} GET {self.path}")
+
+        if self.path == "/healthz":
+            self.send_json(200, {"status": "ok"})
+            return
+
+        if not self.is_authorized():
+            self.reject_unauthorized()
+            return
 
         if self.path.startswith("/paste/"):
 
@@ -84,7 +126,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             url = f"https://pastebin.com/raw/{paste_id}"
 
             try:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, timeout=REQUEST_TIMEOUT)
                 r.raise_for_status()
                 self.send_text(200, r.text)
             except Exception as e:
@@ -105,11 +147,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode()
-            data = json.loads(body)
+        if not self.is_authorized():
+            self.reject_unauthorized()
+            return
 
+        try:
+            data = self.read_json_body()
             prompt = data.get("prompt", "")
             log(f"Prompt length: {len(prompt)}")
 
@@ -118,18 +161,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
-        # -------- LM Studio request --------
+        if not prompt:
+            self.send_error(400, "Missing prompt")
+            return
 
-        payload_old = {
-            "model": "local-model",  # ignored by LM Studio but required
-            "messages": [
-                {"role": "system", "content": "respond with only plaintext"},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7,
-            "max_tokens": 200,
-            "stream": False
-        }
+        # -------- LM Studio request --------
 
         # Identify client (IP or provided id)
         client_id = data.get("id", self.client_ip())
@@ -148,14 +184,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # Trim history (prevents RAM explosion)
         history = [history[0]] + history[-MAX_HISTORY:]
+        conversations[client_id] = history
 
         payload = {
-            "model": "local-model",
+            "model": LMSTUDIO_MODEL,
             "messages": history,
-            "temperature": 0.7,
-            "max_tokens": 200,
+            "temperature": LMSTUDIO_TEMPERATURE,
+            "max_tokens": LMSTUDIO_MAX_TOKENS,
             "stream": False
-        }    
+        }
 
         try:
             log("Forwarding to LM Studio...")
@@ -163,7 +200,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             r = requests.post(
                 LMSTUDIO_URL,
                 json=payload,
-                timeout=120
+                timeout=LMSTUDIO_TIMEOUT
             )
 
             r.raise_for_status()
@@ -180,7 +217,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         lua_reply = '{reply="' + reply.replace('"', '\\"').replace('\n', "") + '"}'
         self.send_text(200, lua_reply)
-        #self.send_json(200, {"reply": reply})
 
     def log_message(self, *args):
         pass
@@ -189,5 +225,5 @@ class ProxyHandler(BaseHTTPRequestHandler):
 # -------------------------------------------------
 
 if __name__ == "__main__":
-    log(f"ComputerCraft proxy listening on port {PORT}")
-    HTTPServer(("", PORT), ProxyHandler).serve_forever()
+    log(f"ComputerCraft proxy listening on {HOST}:{PORT}")
+    ThreadingHTTPServer((HOST, PORT), ProxyHandler).serve_forever()

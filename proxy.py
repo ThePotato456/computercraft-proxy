@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""
-ComputerCraft Unified Proxy w/ Logging
-"""
+"""ComputerCraft proxy backed by the OpenAI API."""
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 import json
 import os
 import requests
 from openai import OpenAI
 
-PORT = 8080
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8080"))
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "200"))
+PROXY_TOKEN = os.environ.get("PROXY_TOKEN")
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "8192"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+client = OpenAI()
 
 
 # -------------------------------------------------
@@ -58,11 +62,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         log(f"{self.client_ip()} -> JSON {code} ({len(encoded)} bytes)")
 
+    def is_authorized(self):
+        if not PROXY_TOKEN:
+            return True
+
+        auth_header = self.headers.get("Authorization", "")
+        bearer_token = auth_header.removeprefix("Bearer ").strip()
+        header_token = self.headers.get("X-Proxy-Token", "").strip()
+        return PROXY_TOKEN in {bearer_token, header_token}
+
+    def reject_unauthorized(self):
+        self.send_json(401, {"error": "unauthorized"})
+
+    def read_json_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+
+        if length <= 0:
+            raise ValueError("missing request body")
+
+        if length > MAX_BODY_BYTES:
+            raise ValueError(f"request body exceeds {MAX_BODY_BYTES} bytes")
+
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body)
+
     # ---------- GET ----------
 
     def do_GET(self):
 
         log(f"{self.client_ip()} GET {self.path}")
+
+        if self.path == "/healthz":
+            self.send_json(200, {"status": "ok"})
+            return
+
+        if not self.is_authorized():
+            self.reject_unauthorized()
+            return
 
         if self.path.startswith("/paste/"):
 
@@ -76,7 +112,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             url = f"https://pastebin.com/raw/{paste_id}"
 
             try:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, timeout=REQUEST_TIMEOUT)
                 r.raise_for_status()
 
                 log(f"Fetched pastebin {paste_id}")
@@ -103,11 +139,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Invalid endpoint")
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            data = json.loads(body)
+        if not self.is_authorized():
+            self.reject_unauthorized()
+            return
 
+        try:
+            data = self.read_json_body()
             prompt = data.get("prompt", "")
 
             log(f"Prompt received ({len(prompt)} chars)")
@@ -128,11 +165,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             log("Sending request to OpenAI...")
 
             response = client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=OPENAI_MODEL,
                 messages=[
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=200
+                max_tokens=OPENAI_MAX_TOKENS
             )
 
             reply = response.choices[0].message.content
@@ -156,5 +193,5 @@ class ProxyHandler(BaseHTTPRequestHandler):
 # -------------------------------------------------
 
 if __name__ == "__main__":
-    log(f"ComputerCraft proxy listening on port {PORT}")
-    HTTPServer(("", PORT), ProxyHandler).serve_forever()
+    log(f"ComputerCraft proxy listening on {HOST}:{PORT}")
+    ThreadingHTTPServer((HOST, PORT), ProxyHandler).serve_forever()
