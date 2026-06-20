@@ -11,7 +11,7 @@ The project includes two server variants:
 
 - `GET /paste/<paste_id>` fetches raw Pastebin content.
 - `POST /chat` accepts a JSON prompt and returns a short model response.
-- `GET /healthz` returns a health check response.
+- `GET /health` returns a health check response.
 - Runtime configuration is handled through environment variables.
 - Optional shared-token authentication for LAN deployments.
 - Request size limits, upstream timeouts, and threaded request handling.
@@ -92,7 +92,7 @@ python proxy_llm.py
 Health check:
 
 ```bash
-curl http://localhost:8080/healthz
+curl http://localhost:8080/health
 ```
 
 Fetch a Pastebin paste:
@@ -112,7 +112,7 @@ curl -X POST http://localhost:8080/chat \
 If `PROXY_TOKEN` is set, include either header:
 
 ```bash
-curl -H "Authorization: Bearer $PROXY_TOKEN" http://localhost:8080/healthz
+curl -H "Authorization: Bearer $PROXY_TOKEN" http://localhost:8080/health
 curl -H "X-Proxy-Token: $PROXY_TOKEN" http://localhost:8080/paste/PASTE_ID
 ```
 

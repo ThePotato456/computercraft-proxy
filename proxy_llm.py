@@ -112,7 +112,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         log(f"{self.client_ip()} GET {self.path}")
 
-        if self.path == "/healthz":
+        if self.path == "/health":
             self.send_json(200, {"status": "ok"})
             return
 
